@@ -9,10 +9,6 @@ Usecase:
 * Change IAM Role policy (by adding new resource) to allow pod to access
   different S3 bucket
 
-Question: I'm not sure if this will work, because initial IAM role is created by
-CloudFormation and then modified by `eksctl` when it is adding the OIDC
-associations. (Two "automation systems" are changing one object independently)
-
 Create IAM Role with Policy allowing access to new S3 bucket:
 
 ```bash
@@ -33,24 +29,20 @@ Resources:
         Statement:
         - Effect: Allow
           Action:
-          - s3:ListBucket
-          - s3:GetBucketLocation
-          - s3:ListBucketMultipartUploads
-          Resource: !GetAtt S3Bucket.Arn
-        - Effect: Allow
-          Action:
-          - s3:PutObject
-          - s3:GetObject
-          - s3:DeleteObject
-          - s3:ListMultipartUploadParts
-          - s3:AbortMultipartUpload
+          - "s3:*"
           Resource:
+          - !Sub "arn:aws:s3:::${AWS::StackName}"
           - !Sub "arn:aws:s3:::${AWS::StackName}/*"
   S3Bucket:
     Type: AWS::S3::Bucket
     Properties:
       AccessControl: Private
       BucketName: !Sub "${AWS::StackName}"
+  S3Bucket2:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      BucketName: !Sub "${AWS::StackName}2"
   Role1:
     Type: 'AWS::IAM::Role'
     Properties:
@@ -106,18 +98,46 @@ Check IAM role 1:
 aws iam list-roles --query "Roles[?contains(RoleName, \`${USER}-s3-iam-test\`) == \`true\`]"
 ```
 
-Create IRSA with previously created IAM role:
+Create IRSA with previously created IAM role.
+Details taken from: [Introducing fine-grained IAM roles for service accounts](https://aws.amazon.com/blogs/opensource/introducing-fine-grained-iam-roles-service-accounts/)
+
+> `eksctl` doesn't configure/set the [trust relationship policy document](https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts-technical-overview.html#iam-role-configuration).
 
 ```bash
-eksctl create iamserviceaccount --cluster ${USER}-k8s --attach-role-arn "${S3_IAM_ARN}" --namespace s3-test --name s3-test --approve
-# ^^^^ This is not working properly - OIDC details are not visible in IAM role
-# Trust hasn't been established...
+eksctl create iamserviceaccount --cluster ${USER}-k8s --attach-role-arn "${S3_IAM_ARN}" --namespace s3-test --name s3-test --approve --override-existing-serviceaccounts
+
+ISSUER_URL=$(aws eks describe-cluster --name "${USER}-k8s" --query cluster.identity.oidc.issuer --output text)
+ISSUER_HOSTPATH=$(echo $ISSUER_URL | cut -f 3- -d'/')
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+PROVIDER_ARN="arn:aws:iam::${ACCOUNT_ID}:oidc-provider/${ISSUER_HOSTPATH}"
+
+cat > /tmp/irp-trust-policy.json << EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "$PROVIDER_ARN"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "${ISSUER_HOSTPATH}:sub": "system:serviceaccount:s3-test:s3-test"
+        }
+      }
+    }
+  ]
+}
+EOF
+
+aws iam update-assume-role-policy --role-name "${USER}-s3-iam-test" --policy-document file:///tmp/irp-trust-policy.json
 ```
 
 Check IAM role 2:
 
 ```bash
-aws iam list-roles --query "Roles[?contains(RoleName, \`${S3_IAM_ARN}\`) == \`true\`]"
+aws iam list-roles --query "Roles[?contains(RoleName, \`${USER}-s3-iam-test\`) == \`true\`]"
 ```
 
 You should see something like:
@@ -134,7 +154,6 @@ You should see something like:
                     "Condition": {
                         "StringEquals": {
                             "oidc.eks.eu-west-1.amazonaws.com/id/Bxxxxxxxxxxxxxxxxxxxxxxxxx3:sub": "system:serviceaccount:s3-test:s3-test",
-                            "oidc.eks.eu-west-1.amazonaws.com/id/Bxxxxxxxxxxxxxxxxxxxxxxxxx3:aud": "sts.amazonaws.com"
                         }
                     }
                 }
@@ -156,16 +175,22 @@ spec:
   containers:
   - name: aws-cli
     image: amazon/aws-cli
+    env:
+    - name: HOME
+      value: "/tmp"
+    - name: AWS_DEFAULT_REGION
+      value: "${AWS_DEFAULT_REGION}"
     command:
       - /bin/bash
       - -c
       - |
         set -x
-        export HOME=/tmp
-        aws s3 ls --region ${AWS_DEFAULT_REGION} s3://${USER}-s3-iam-test/
-        aws s3 cp --region ${AWS_DEFAULT_REGION} /etc/hostname s3://${USER}-s3-iam-test/
-        aws s3 ls --region ${AWS_DEFAULT_REGION} s3://${USER}-s3-iam-test/
+        aws s3 ls s3://${USER}-s3-iam-test/
+        aws s3 cp /etc/hostname s3://${USER}-s3-iam-test/
+        aws s3 ls s3://${USER}-s3-iam-test/
         aws s3 rm s3://${USER}-s3-iam-test/hostname
+        echo "This should not work:"
+        aws s3 cp /etc/hostname s3://${USER}-s3-iam-test2/
   restartPolicy: Never
 EOF
 ```
@@ -173,7 +198,7 @@ EOF
 Check the result of the operation by looking at the logs outputs:
 
 ```bash
-kubectl wait --namespace s3-test --for=condition=Ready pod s3-test && sleep 5
+sleep 10
 kubectl logs -n s3-test s3-test
 ```
 
@@ -181,7 +206,7 @@ Add a new bucket to the existing CloudFormation stack, where I would like to
 write some data from the pod:
 
 ```bash
-sed '/arn:aws:s3/a \ \ \ \ \ \ \ \ \ \ - !Sub "arn:aws:s3:::another_s3_bucket/*"' /tmp/aws-s3-iam.yml
+sed -i '/arn:aws:s3:::${AWS::StackName}\/\*/a \ \ \ \ \ \ \ \ \ \ - !Sub "arn:aws:s3:::${AWS::StackName}2/*"\n \ \ \ \ \ \ \ \ \ - !Sub "arn:aws:s3:::${AWS::StackName}2"' /tmp/aws-s3-iam.yml
 ```
 
 See the updated CloudFormation template:
@@ -206,18 +231,59 @@ cat /tmp/aws-s3-iam.yml
           - s3:ListMultipartUploadParts
           - s3:AbortMultipartUpload
           Resource:
+          - !Sub "arn:aws:s3:::${AWS::StackName}"
           - !Sub "arn:aws:s3:::${AWS::StackName}/*"
-          - !Sub "arn:aws:s3:::another_s3_bucket/*
+          - !Sub "arn:aws:s3:::${AWS::StackName}2/*"
+          - !Sub "arn:aws:s3:::${AWS::StackName}2"
 ...
 ```
 
 Apply the template to existing CloudFormation stack:
 
 ```bash
-aws cloudformation update-stack --stack-name "${USER}-s3-iam-test" --template-url file:///tmp/aws-s3-iam.yml
+aws cloudformation update-stack --stack-name "${USER}-s3-iam-test" --capabilities CAPABILITY_NAMED_IAM --template-body file:///tmp/aws-s3-iam.yml
 ```
 
-Check if the command above fail or of it will pass ^^^ !
+Test IRSA - another pod which is using `s3-test` service account should be able to write
+to another S3 bucket `${USER}-s3-iam-test2`
 
-In therory it should fail, because `eksctl` should modify it when running
-`eksctl create iamserviceaccount`.
+```bash
+export KUBECONFIG="/tmp/kubeconfig.conf"
+kubectl apply -f - << EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: s3-test2
+  namespace: s3-test
+spec:
+  serviceAccountName: s3-test
+  containers:
+  - name: aws-cli
+    image: amazon/aws-cli
+    env:
+    - name: HOME
+      value: "/tmp"
+    - name: AWS_DEFAULT_REGION
+      value: "${AWS_DEFAULT_REGION}"
+    command:
+      - /bin/bash
+      - -c
+      - |
+        set -x
+        export HOME=/tmp
+        aws s3 ls s3://${USER}-s3-iam-test2/
+        aws s3 cp /etc/hostname s3://${USER}-s3-iam-test2/
+        aws s3 ls s3://${USER}-s3-iam-test2/
+        aws s3 rm s3://${USER}-s3-iam-test2/hostname
+        aws s3 cp /etc/hostname s3://${USER}-s3-iam-test/
+        aws s3 rm s3://${USER}-s3-iam-test/hostname
+  restartPolicy: Never
+EOF
+```
+
+Check the result of the operation by looking at the logs outputs:
+
+```bash
+sleep 10
+kubectl logs -n s3-test s3-test2
+```
